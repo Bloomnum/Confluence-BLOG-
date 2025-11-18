@@ -1,0 +1,150 @@
+import java.time.Instant
+import groovyx.net.http.RESTClient
+import static groovyx.net.http.ContentType.JSON
+import java.time.LocalDate
+import java.time.ZoneId
+
+// Настройки подключения
+def spaceKey = "Your_spacekey"
+def baseUrl = "https://your_confluence.com/wiki"
+def authToken = "your_token"
+
+def client = new RESTClient(baseUrl)
+def authHeaders = [
+    'Authorization': "Bearer ${authToken}",
+    'Content-Type' : 'application/json'
+]
+
+// Параметры пагинации для получения страниц
+def start = 0
+def limit = 100
+def allPages = []
+
+// Получаем все блог-посты для пространства с использованием пагинации
+while (true) {
+    def params = [
+        type: 'blogpost',
+        expand: 'body.view,version',
+        spaceKey: spaceKey,
+        limit: limit,
+        start: start
+    ]
+
+    try {
+        def response = client.get(
+            path: "/rest/api/content",  
+            query: params,
+            headers: authHeaders,
+            contentType: JSON
+        )
+
+        if (!response.data.results || response.data.results.isEmpty()) {
+            break
+        }
+
+        def currentPageResults = response.data.results
+        allPages.addAll(currentPageResults)
+
+        if (currentPageResults.size() < limit) { // Последняя страница
+            break
+        }
+        start += limit
+    } catch (Exception e) {
+        log.warn "Ошибка запроса страниц для пространства ${spaceKey}: ${e.message}"
+        //log.warn "URL запроса: ${baseUrl}/rest/api/content?type=blogpost&spaceKey=${spaceKey}&start=${start}"
+        break
+    }
+}
+
+log.warn "Всего страниц для обработки: ${allPages.size()}"
+
+def currentDate = LocalDate.now(ZoneId.systemDefault())
+
+// Обработка каждой страницы
+allPages.each { page ->
+    try {
+        
+        // Определяем дату последнего изменения
+        def lastModified = Instant.parse(page.version.when)
+                             .atZone(ZoneId.systemDefault())
+                             .toLocalDate()
+        //log.warn "Дата последнего изменения страницы ${page.id}: ${lastModified}"
+
+        // Если страница изменилась сегодня и есть предыдущая версия
+        if (lastModified == currentDate && page.version.number > 1) {
+            def previousVersionNumber = page.version.number - 1
+            //log.warn "Попытка получить предыдущую версию ${previousVersionNumber} для страницы ${page.id}"
+
+            // Сначала пытаемся получить список версий через стандартный endpoint
+            def versionListPath = "/rest/api/content/${page.id}/version"
+            def versionListResponse
+            try {
+                versionListResponse = client.get(
+                    path: versionListPath,
+                    query: [expand: 'content.body.storage'],
+                    headers: authHeaders,
+                    contentType: JSON
+                )
+            } catch (Exception e) {
+                versionListPath = "/rest/experimental/content/${page.id}/version"
+                versionListResponse = client.get(
+                    path: versionListPath,
+                    query: [expand: 'content.body.storage'],
+                    headers: authHeaders,
+                    contentType: JSON
+                )
+            }
+
+            if (versionListResponse.status != 200) {
+                throw new Exception("Ошибка получения списка версий для страницы ${page.id}: ${versionListResponse.status}")
+            }
+
+            def versions = versionListResponse.data.results
+
+            def previousVersion = versions.find { it.number == previousVersionNumber }
+            if (!previousVersion) {
+                throw new Exception("Предыдущая версия не найдена для страницы ${page.id}")
+            }
+
+            def prevContent = previousVersion?.content?.body?.storage?.value
+            if (!prevContent) {
+                throw new Exception("Предыдущая версия не содержит данных (body.storage) для страницы ${page.id}")
+            }
+
+            // Выполняем откат страницы, создавая новую версию с содержимым предыдущей версии.
+            // Добавлено свойство minorEdit: true для отключения уведомлений.
+            def updateBody = [
+                version: [
+                    number: page.version.number + 1,
+                    minorEdit: true  // Параметр отключения уведомлений
+                ],
+                title: page.title,
+                type: page.type,
+                body: [
+                    storage: [
+                        value: prevContent,
+                        representation: "storage"
+                    ]
+                ]
+            ]
+
+            def updateResponse = client.put(
+                path: "/rest/api/content/${page.id}",
+                body: updateBody,
+                headers: authHeaders,
+                contentType: JSON
+            )
+
+            if (updateResponse.status == 200) {
+                log.warn "Страница ${page.id} успешно откачена на предыдущую версию"
+            } else {
+                throw new Exception("Ошибка отката версии для страницы ${page.id}: ${updateResponse.status}")
+            }
+        } else {
+            log.warn "Страница ${page.id} не была изменена сегодня или это первая версия"
+        }
+    } catch (Exception e) {
+        log.warn "Произошла ошибка при обработке страницы ${page.id}: ${e.message}"
+    }
+}
+//nocomment

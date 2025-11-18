@@ -1,0 +1,188 @@
+import groovyx.net.http.RESTClient
+import static groovyx.net.http.ContentType.JSON
+import org.apache.commons.text.StringEscapeUtils
+import java.util.regex.Pattern
+
+// Ключ пространства
+def spaceKey = "your_space_key"
+// Токен доступа
+def authToken = "your_token"
+// Базовый URL API
+def baseUrl = "https://your_confluence.com/rest/api/content?type=blogpost&expand=body.view,version&spaceKey=${spaceKey}"
+def baseHost = "https://your_confluence.com"
+
+// Параметры пагинации
+def start = 0
+def limit = 100
+
+def authHeaders = [
+    Accept: 'application/json',
+    Authorization: "Bearer ${authToken}"
+]
+
+// Функция для извлечения тегов <a href="...">...</a>
+// Исключает теги, обёрнутые целиком в <p>...</p>
+def extractAnchorTags(String blogContent) {
+    def anchorTags = []
+    def pattern = ~/(?is)(<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>.*?<\/a>)/
+    def matcher = pattern.matcher(blogContent)
+    while (matcher.find()) {
+        def anchorTag = matcher.group(1)
+        def pPattern = ~/(?is)<p>\s*${Pattern.quote(anchorTag)}\s*<\/p>/
+        if (!(blogContent =~ pPattern)) {
+            anchorTags << anchorTag
+        }
+    }
+    return anchorTags
+}
+
+// Извлекает href из тега <a> и возвращает его только если:
+// 1. URL не начинается с "http://" или "https://"
+// 2. URL не имеет формат "/display/~USER" (ссылка на пользователя)
+// 3. URL не равен ровно "#"
+// 4. URL не начинается с "callto:", "mailto:" или "tel:"
+def extractHrefFromAnchor(String anchorTag) {
+    def matcher = anchorTag =~ /(?i)<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>/
+    if (matcher.find()) {
+        def url = matcher.group(1)
+        if (url?.toLowerCase().startsWith("http://") || url?.toLowerCase().startsWith("https://")) {
+            return null
+        }
+        if (url ==~ /^\/display\/~.+/) {
+            return null
+        }
+        if (url == "#") {
+            return null
+        }
+        if (url?.toLowerCase().startsWith("callto:") ||
+            url?.toLowerCase().startsWith("mailto:") ||
+            url?.toLowerCase().startsWith("tel:")) {
+            return null
+        }
+        return url
+    }
+    return null
+}
+
+// Функция преобразования ссылок
+def convertAnchorLinks(String content, String baseHost) {
+    def regex = /(?si)<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>(.*?)<\/a>/
+    return content.replaceAll(regex) { fullMatch, url, linkText ->
+        // Если внутри ссылки есть тег <img>, возвращаем исходный HTML без преобразования (была проблема со страницами которые имели картинки)
+        if (linkText.toLowerCase().contains("<img")) {
+            return fullMatch
+        }
+        // Пропускаем ссылки формата пользователя
+        if (url.contains("display/~")) {
+            def text = linkText?.replaceAll(/<[^>]+>/, "")?.trim()
+            return text?: ""
+        }
+        // Для относительных ссылок, начинающихся с "/pages", "/download" или "/display"
+        if ((url.startsWith("/pages") || url.startsWith("/download") || url.startsWith("/display")) &&!url.startsWith("http")) {
+            url = baseHost + url
+        }
+        // Если URL содержит нужные подстроки, преобразовываем ссылку
+        if (url.contains("pages/") || url.contains("display/AISD") || url.contains("download/")) {
+            def text = linkText?.replaceAll(/<[^>]+>/, "")?.trim()
+            if (text && text.toLowerCase().contains("http")) {
+                return "${url.trim()} "
+            } else if (text) {
+                return "${text} ${url.trim()} "
+            } else {
+                return "${url.trim()} "
+            }
+        }
+        return fullMatch
+    }
+}
+
+// Получаем все блог-посты через REST API с пагинацией
+def allBlogPosts = []
+def client = new RESTClient("")
+while (true) {
+    def paginatedUrl = "${baseUrl}&limit=${limit}&start=${start}"
+    try {
+        def blogResponse = client.get(
+            uri: paginatedUrl,
+            contentType: JSON,
+            headers: authHeaders
+        )
+        if (!blogResponse?.data?.results || blogResponse.data.results.isEmpty()) {
+            break
+        }
+        def currentPageResults = blogResponse.data.results
+        allBlogPosts.addAll(currentPageResults)
+        if (currentPageResults.size() < limit) { // последняя страница
+            break
+        }
+        start += limit
+    } catch (Exception e) {
+        log.warn "Ошибка запроса блога для пространства ${spaceKey}: ${e.message}"
+        break
+    }
+}
+
+// Обработка каждого блог-поста от имени пользователя "astrabot"
+Users.runAs("astrabot") {
+    allBlogPosts.each { blogPost ->
+        def blogContent = blogPost.body?.view?.value ?: ""
+        if (blogContent) {
+            def anchorTags = extractAnchorTags(blogContent)
+            def anchorUrls = anchorTags.collect { extractHrefFromAnchor(it) }
+                               .findAll { it!= null }
+
+            if (!anchorUrls.isEmpty()) {
+                log.warn "\nСтраница с ID: ${blogPost.id} содержит следующие макросные ссылки:"
+                anchorUrls.each { url ->
+                    def fullUrl = "${baseHost}${url}"
+                    log.warn "[ID: ${blogPost.id}] ${fullUrl}"
+                }
+
+                // Преобразуем содержимое страницы
+                def convertedContent = convertAnchorLinks(blogContent, baseHost)
+
+                // Перед отправкой фиксируем теги изображений: приводим <img> к self-closing виду
+                // Для корректного парсинга XHTML в ConflCE
+                convertedContent = convertedContent.replaceAll(/<img([^>]+?)(?<!\/)>/) { fullMatch, attr ->
+                    // Если уже оканчивается на />, оставляем как есть
+                    fullMatch.trim().endsWith("/>")? fullMatch : "${fullMatch.substring(0, fullMatch.length()-1)}/>"
+                }
+
+                if (blogContent != convertedContent) {
+                    def updateUrl = "https://your_confluence.com/rest/api/content/${blogPost.id}"
+                    def payload = [
+                        version: [
+                            number: (blogPost.version?.number ?: 1) + 1,
+                            minorEdit: true
+                        ],
+                        title: blogPost.title,
+                        type: blogPost.type,
+                        body: [
+                            storage: [
+                                value: convertedContent,
+                                representation: "storage"
+                            ]
+                        ]
+                    ]
+                    //log.warn "Отправляем запрос на обновление страницы с payload:\n${new groovy.json.JsonBuilder(payload).toPrettyString()}"
+                    def updateClient = new RESTClient("")
+                    try {
+                        def updateResponse = updateClient.put(
+                            uri: updateUrl,
+                            body: payload,
+                            requestContentType: JSON,
+                            headers: authHeaders
+                        )
+                        log.warn "Статус обновления: ${updateResponse.status}"
+                        log.warn "Тело ответа: ${updateResponse.data}"
+                    } catch (Exception e) {
+                        log.warn "Ошибка обновления страницы (ID: ${blogPost.id}):"
+                        log.warn "Сообщение: ${e.message}"
+                        log.warn "Ответ: ${e.response?.data}"
+                    }
+                }
+            }
+        }
+    }
+}
+//nocomment

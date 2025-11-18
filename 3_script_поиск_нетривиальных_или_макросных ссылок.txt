@@ -1,0 +1,114 @@
+import groovyx.net.http.RESTClient
+import static groovyx.net.http.ContentType.JSON
+import java.util.regex.Pattern
+
+// Ключ пространства
+def spaceKey = "your_space_key"
+// Токен доступа
+def authToken = "your_token" // BOT
+
+// Параметры пагинации
+def start = 0
+def limit = 100
+
+// Базовый URL API
+def baseUrl = "https://your_confluence.com/rest/api/content?type=blogpost&expand=body.view,version&spaceKey=${spaceKey}"
+def baseHost = "https://your_confluence.com"
+
+def authHeaders = [
+    Accept: 'application/json',
+    Authorization: "Bearer ${authToken}"
+]
+
+// Функция для извлечения тегов <a href="...">...</a>
+// Исключает теги, обёрнутые целиком в <p>...</p>
+def extractAnchorTags(String blogContent) {
+    def anchorTags = []
+    def pattern = ~/(?is)(<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>.*?<\/a>)/
+    def matcher = pattern.matcher(blogContent)
+    while (matcher.find()) {
+        def anchorTag = matcher.group(1)
+        def pPattern = ~/(?is)<p>\s*${Pattern.quote(anchorTag)}\s*<\/p>/
+        if (!(blogContent =~ pPattern)) {
+            anchorTags << anchorTag
+        }
+    }
+    return anchorTags
+}
+
+// Извлекает href из тега <a> и возвращает его только если:
+// 1. URL не начинается с "http://" или "https://"
+// 2. URL не имеет формат "/display/~USER" (ссылка на пользователя)
+// 3. URL не равен ровно "#"
+// 4. URL не начинается с "callto:", "mailto:", или "tel:"
+def extractHrefFromAnchor(String anchorTag) {
+    def matcher = anchorTag =~ /(?i)<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>/
+    if (matcher.find()) {
+        def url = matcher.group(1)
+        // Проверяем все условия фильтрации
+        if( url?.toLowerCase().startsWith("http://") || url?.toLowerCase().startsWith("https://") ) {
+            return null
+        }
+        if( url ==~ /^\/display\/~.+/ ) {
+            return null
+        }
+        if( url == "#" ) {
+            return null
+        }
+        if( url?.toLowerCase().startsWith("callto:") ||
+            url?.toLowerCase().startsWith("mailto:") ||
+            url?.toLowerCase().startsWith("tel:") ) {
+            return null
+        }
+        return url
+    }
+    return null
+}
+
+// Получаем все блог-посты через REST API с пагинацией
+def allBlogPosts = []
+def client = new RESTClient("")
+while (true) {
+    def paginatedUrl = "${baseUrl}&limit=${limit}&start=${start}"
+    try {
+        def blogResponse = client.get(
+            uri: paginatedUrl,
+            contentType: JSON,
+            headers: authHeaders
+        )
+        if (!blogResponse?.data?.results || blogResponse.data.results.isEmpty()) {
+            break
+        }
+        def currentPageResults = blogResponse.data.results
+        allBlogPosts.addAll(currentPageResults)
+        if (currentPageResults.size() < limit) { // последняя страница
+            break
+        }
+        start += limit
+    } catch (Exception e) {
+        log.warn "Ошибка запроса блога для пространства ${spaceKey}: ${e.message}"
+        break
+    }
+}
+
+// Обработка каждого блог-поста
+allBlogPosts.each { blogPost ->
+    // Используем значение из body.view.value
+    def blogContent = blogPost.body?.view?.value ?: ""
+    if (blogContent) {
+        // Обработка тегов <a href="...">
+        def anchorTags = extractAnchorTags(blogContent)
+        def anchorUrls = anchorTags.collect { extractHrefFromAnchor(it) }
+                                    .findAll { it != null }
+
+        if (!anchorUrls.isEmpty()) {
+            log.warn "\nСтраница с ID: ${blogPost.id} содержит следующие макросные ссылки:"
+            anchorUrls.each { url ->
+                // Добавляем базовый хост к URL
+                def fullUrl = "${baseHost}${url}"
+                log.warn "[ID: ${blogPost.id}] ${fullUrl}"
+            }
+        }
+    }
+}
+//nocomment

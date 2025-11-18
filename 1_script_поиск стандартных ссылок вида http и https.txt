@@ -1,0 +1,79 @@
+import groovyx.net.http.RESTClient
+import static groovyx.net.http.ContentType.JSON
+import org.apache.commons.text.StringEscapeUtils
+
+// Ключ пространства
+def spaceKey = "your_space_key"
+// Токен доступа
+def authToken = "your_token" //
+// Параметры пагинации (ОБХОД ЛИМИТА ОБРАБОТКИ)
+def start = 0
+def limit = 100
+// Базовый URL API
+def baseUrl = "https://your_confluence.com/rest/api/content?type=blogpost&expand=body.view,version&spaceKey=${spaceKey}"
+def authHeaders = [
+    Accept: 'application/json',
+    Authorization: "Bearer ${authToken}"
+]
+
+/**
+ * Функция извлекает все ссылки из атрибута href тега <a> из переданного контента.
+ * Производится декодирование Unicode-эскейпов, и затем перебор всех совпадений по шаблону.
+ * Добавляются только URL, начинающиеся с "http://" или "https://".
+ */
+def extractAnchorUrls(String content) {
+    // Декодируем строку с Unicode-эскейпами (например, \u003C заменяется на <)
+    String decodedContent = StringEscapeUtils.unescapeHtml4(content)
+    def urls = [] as List
+    def matcher = decodedContent =~ /(?i)<a\s+[^>]*href\s*=\s*"([^"]+)"/
+    matcher.each { match ->
+        def url = match[1]?.trim()
+    
+        if (url?.toLowerCase().startsWith("http://") || url?.toLowerCase().startsWith("https://")) {
+            urls << url
+        }
+    }
+    return urls
+}
+
+// Получаем все блог-посты с использованием пагинации
+def allBlogPosts = []
+def client = new RESTClient("")
+while (true) {
+    def paginatedUrl = "${baseUrl}&limit=${limit}&start=${start}"
+    try {
+        def blogResponse = client.get(
+            uri: paginatedUrl,
+            contentType: JSON,
+            headers: authHeaders
+        )
+        if (!blogResponse?.data?.results || blogResponse.data.results.isEmpty()) {
+            break
+        }
+        def currentPageResults = blogResponse.data.results
+        allBlogPosts.addAll(currentPageResults)
+        if (currentPageResults.size() < limit) { // Последняя страница
+            break
+        }
+        start += limit
+    } catch (Exception e) {
+        log.warn "Ошибка запроса блога для пространства ${spaceKey}: ${e.message}"
+        break
+    }
+}
+log.warn "Всего получено блог-постов: ${allBlogPosts.size()}"
+
+// Обрабатываем каждый блог-пост: извлекаем ссылки из body.view.value и выводим их в лог
+allBlogPosts.each { blogPost ->
+    def blogContent = blogPost.body?.view?.value ?: ""
+    if (blogContent) {
+        def anchorUrls = extractAnchorUrls(blogContent)
+        if (!anchorUrls.isEmpty()) {
+            log.warn "\nСтраница с ID: ${blogPost.id} содержит следующие внешние ссылки:"
+            anchorUrls.each { url ->
+                log.warn "[ID: ${blogPost.id}] " + url
+            }
+        }
+    }
+}
+//nocomment

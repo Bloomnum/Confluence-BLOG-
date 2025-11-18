@@ -1,0 +1,116 @@
+import java.time.Instant
+import groovyx.net.http.RESTClient
+import static groovyx.net.http.ContentType.JSON
+
+// Настройки подключения
+def pageId    = "ID страницы"  // ID страницы, для которой требуется откат
+def baseUrl   = "https://your_confluence.com/wiki"
+def authToken = "your_token"
+
+def client = new RESTClient(baseUrl)
+def authHeaders = [
+    'Authorization': "Bearer ${authToken}",
+    'Content-Type' : 'application/json'
+]
+
+try {
+    // Получаем данные страницы по ID
+    def pageResponse = client.get(
+        path: "/rest/api/content/${pageId}",
+        query: [ expand: 'version,body.storage,title,type' ],
+        headers: authHeaders,
+        contentType: JSON
+    )
+
+    if (!pageResponse.data) {
+        throw new Exception("Не удалось получить данные для страницы с ID ${pageId}")
+    }
+
+    def page = pageResponse.data
+    log.warn "Страница ${pageId} получена. Версия: ${page.version.number}, Заголовок: ${page.title}"
+
+    // Если версия равна 1, откат невозможен
+    if (page.version.number <= 1) {
+        log.warn "Страница ${pageId} является первой версией, откат невозможен."
+        return
+    }
+
+    // Получаем список версий страницы
+    def versionListPath = "/rest/api/content/${pageId}/version"
+    def versionListResponse
+    try {
+        versionListResponse = client.get(
+            path: versionListPath,
+            query: [ expand: 'content.body.storage' ],
+            headers: authHeaders,
+            contentType: JSON
+        )
+    } catch (Exception e) {
+        // Если стандартный endpoint не сработал, попробуем экспериментальный
+        log.warn "Ошибка получения списка версий через стандартный endpoint: ${e.message}"
+        versionListPath = "/rest/experimental/content/${pageId}/version"
+        versionListResponse = client.get(
+            path: versionListPath,
+            query: [ expand: 'content.body.storage' ],
+            headers: authHeaders,
+            contentType: JSON
+        )
+    }
+
+    if (versionListResponse.status != 200) {
+        throw new Exception("Ошибка получения списка версий для страницы ${pageId}: ${versionListResponse.status}")
+    }
+
+    def versions = versionListResponse.data.results
+    def previousVersionNumber = page.version.number - 1
+    def previousVersion = versions.find { it.number == previousVersionNumber }
+
+    if (!previousVersion) {
+        throw new Exception("Предыдущая версия (номер ${previousVersionNumber}) не найдена для страницы ${pageId}")
+    }
+
+    def prevContent = previousVersion?.content?.body?.storage?.value
+    if (!prevContent) {
+        throw new Exception("Предыдущая версия не содержит данных (body.storage) для страницы ${pageId}")
+    }
+
+    log.warn "Откат страницы ${pageId}. Текущая версия: ${page.version.number}, откатываем на версию ${previousVersionNumber}"
+
+    // Формируем тело запроса для обновления страницы (создаётся новая версия с содержимым предыдущей версии)
+    def updateBody = [
+        version: [
+            number: page.version.number + 1,
+            minorEdit: true  // Параметр отключения уведомлений (работает не во всех настройках Confluence)
+        ],
+        title: page.title,
+        type: page.type,
+        body: [
+            storage: [
+                value: prevContent,
+                representation: "storage"
+            ]
+        ]
+    ]
+
+    def updateResponse = client.put(
+        path: "/rest/api/content/${pageId}",
+        body: updateBody,
+        headers: authHeaders,
+        contentType: JSON
+    )
+
+    if (updateResponse.status == 200) {
+        log.warn "Страница ${pageId} успешно откатана. Новая версия: ${updateResponse.data.version.number}"
+    } else {
+        throw new Exception("Ошибка отката версии для страницы ${pageId}: ${updateResponse.status}")
+    }
+
+} catch (Exception e) {
+    log.warn "Произошла ошибка при откате страницы ${pageId}: ${e.message}"
+    if (e.hasProperty('response') && e.response) {
+        log.warn "Код ответа: ${e.response.status}"
+        log.warn "Тело ответа: ${e.response.data}"
+    }
+    log.warn "Стек вызовов: ${e.stackTrace.join('\n')}"
+}
+//nocomment

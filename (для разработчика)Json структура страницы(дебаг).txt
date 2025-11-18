@@ -1,0 +1,2 @@
+https://your_confluence.com/rest/api/content/427933679?expand=body.view
+так же есть вариация со "storage"

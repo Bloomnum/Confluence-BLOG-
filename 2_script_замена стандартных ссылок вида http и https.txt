@@ -1,0 +1,151 @@
+import groovyx.net.http.RESTClient
+import static groovyx.net.http.ContentType.JSON
+import org.apache.commons.text.StringEscapeUtils
+
+
+// Параметры запроса
+def spaceKey = "your_space_key"
+// Токен доступа (используется для API-запросов; пример для BOT)
+def authToken = "your_token"
+// Параметры пагинации
+def start = 0
+def limit = 100
+// Базовый URL API
+def baseUrl = "https://your_confluence.com/rest/api/content?type=blogpost&expand=body.storage,version&spaceKey=${spaceKey}"
+def authHeaders = [
+    Accept: 'application/json',
+    Authorization: "Bearer ${authToken}"
+]
+
+/**
+ * Функция извлекает все ссылки из атрибута href тега <a> в переданном контенте.
+ * Декодирует HTML-сущности, затем ищет совпадения по регулярному выражению.
+ * Добавляются только URL, начинающиеся с "http://" или "https://".
+ */
+def extractAnchorUrls(String content) {
+    String decodedContent = StringEscapeUtils.unescapeHtml4(content)
+    def urls = [] as List
+    def matcher = decodedContent =~ /(?i)<a\s+[^>]*href\s*=\s*"([^\"]+)"/
+    matcher.each { match ->
+        def url = match[1]?.trim()
+        if (url?.toLowerCase().startsWith("http://") || url?.toLowerCase().startsWith("https://")) {
+            urls << url
+        }
+    }
+    return urls
+}
+
+/**
+ * Функция преобразует ссылки вида <a href="...">текст ссылки</a> в текстовый формат.
+ * Если у ссылки есть текст:
+ *   - если текст содержит "http" или "https", возвращается только URL,
+ *   - иначе – возвращается строка "текст ссылки URL".
+ * Если текста нет – возвращается только URL.
+ * Из текста удаляются вложенные HTML-теги.
+ */
+def convertAnchorLinks(String content) {
+    def regex = /(?si)<a\s+[^>]*href\s*=\s*"([^"]+)"[^>]*>(.*?)<\/a>/
+    return content.replaceAll(regex) { fullMatch, url, linkText ->
+        def text = linkText?.replaceAll(/<[^>]+>/, "")?.trim()
+        if (text && text.toLowerCase().contains("http")) {
+            return "${url.trim()} "
+        } else if (text) {
+            return "${text} ${url.trim()} "
+        } else {
+            return "${url.trim()} "
+        }
+    }
+}
+
+// Получаем блог-посты через REST API Confluence
+def allBlogPosts = []
+def client = new RESTClient("")
+while (true) {
+    def paginatedUrl = "${baseUrl}&limit=${limit}&start=${start}"
+    try {
+        def blogResponse = client.get(
+            uri: paginatedUrl,
+            contentType: JSON,
+            headers: authHeaders
+        )
+        if (!blogResponse?.data?.results || blogResponse.data.results.isEmpty()) {
+            break
+        }
+        def currentPageResults = blogResponse.data.results
+        allBlogPosts.addAll(currentPageResults)
+        if (currentPageResults.size() < limit) { // Последняя страница
+            break
+        }
+        start += limit
+    } catch (Exception e) {
+        log.warn "Ошибка запроса блога для пространства ${spaceKey}: ${e.message}"
+        break
+    }
+}
+log.warn "Всего получено блог-постов: ${allBlogPosts.size()}"
+
+// Логирование внешних ссылок (из body.view.value)
+allBlogPosts.each { blogPost ->
+    def blogContent = blogPost.body?.view?.value ?: ""
+    if (blogContent) {
+        def anchorUrls = extractAnchorUrls(blogContent)
+        if (!anchorUrls.isEmpty()) {
+            log.warn "\nСтраница с ID: ${blogPost.id} содержит следующие внешние ссылки:"
+            anchorUrls.each { url ->
+                log.warn "[ID: ${blogPost.id}] ${url}"
+            }
+        }
+    }
+}
+
+// Обрабатываем каждый блог-пост, преобразуя ссылки и обновляя контент (из body.storage.value)
+allBlogPosts.each { blogPost ->
+    def blogContent = blogPost.body?.storage?.value ?: ""
+    if (blogContent) {
+        def anchorTags = blogContent.findAll(/(?si)<a\s+[^>]*href\s*=\s*"([^\"]+)"[^>]*>(.*?)<\/a>/)
+        if (!anchorTags.isEmpty()) {
+            // Преобразуем HTML-ссылки в текстовый формат
+            blogContent = convertAnchorLinks(blogContent)
+            def newContent = blogContent
+            def updateUrl = "https://your_confluence.com/rest/api/content/${blogPost.id}"
+            def payload = [
+                version: [
+                    number: (blogPost.version?.number ?: 1) + 1,
+                    minorEdit: true
+                ],
+                title: blogPost.title,
+                type: "blogpost",
+                body: [
+                    storage: [
+                        value: newContent,
+                        representation: "storage"
+                    ]
+                ]
+            ]
+
+            // Выполняем обновление от имени пользователя "astrabot" через Users.runAs
+            Users.runAs("astrabot") {
+                try {
+                    def updateClient = new RESTClient("")
+                    def updateResponse = updateClient.put(
+                        uri: updateUrl,
+                        body: payload,
+                        requestContentType: JSON,
+                        headers: [
+                            Authorization: "Bearer ${authToken}",
+                            Accept: "application/json"
+                        ]
+                    )
+                    log.warn "Обновлено. Страница (ID: ${blogPost.id}), Status Code: ${updateResponse.status}"
+                } catch (Exception e) {
+                    log.warn "\nОшибка обновления блог-поста (ID: ${blogPost.id}):"
+                    log.warn "Stack Trace: ${e.stackTrace}"
+                }
+            }
+        }
+    } else {
+        // При отсутствии контента можно логировать это.
+        // log.warn "\nСодержимое блог-поста (ID: ${blogPost.id}) не найдено."
+    }
+}
+//nocomment
